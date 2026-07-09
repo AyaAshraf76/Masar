@@ -14,7 +14,6 @@ Graduation project: a self-driving RC car with lane keeping, lane changing, adap
 | `rl_lane_keeping/` | PPO training scripts for lane keeping in simulation (v3 → v3.3) |
 | `simulation/` | Unity sim build + gym-donkeycar submodule |
 | `car_design/` | Mechanical CAD + PCB files (to be added) |
-| `docs/` | Thesis chapters and deployment notes |
 | `dev_tools/` | Old motor test scripts, kept for reference |
 
 ## System overview

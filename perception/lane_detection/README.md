@@ -8,6 +8,8 @@ Camera-based lane detection running on the Raspberry Pi 5.
 - `lane_stream_final.py` — runs on Pi, captures frames, runs inference, streams JSON data (port 9999) and annotated video (port 9998) to the laptop
 - `lane_viewer.py` — runs on laptop, connects to the video stream and displays it (press Q to quit, F for fullscreen)
 - `ros2_ws/src/lane_bridge/` — ROS2 node that receives the JSON stream and publishes lane topics
+- `Lane_Detection_Lane_Keeping_Chapter__3_.docx` — thesis chapter on lane detection and lane keeping
+- `Lane_Detection_Challenges_Report.docx` — challenges faced during development
 
 The model takes 320×240 RGB input. Post-processing extracts lane center, width, which lane (inner/outer), error in cm, and curvature. Both lanes are 35cm wide.
 
