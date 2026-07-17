@@ -53,7 +53,7 @@ Eval is a deterministic 5000-step rollout. "Right err" is the median tracking er
 | v3      | rate actions + positive reward | 0       | 0.22      | 1.93     | 2.63    |
 | v3.1    | + damping + speed term         | 5       | 0.10      | 1.60     | 3.26    |
 | v3.2    | + wall drift arrest            | 0       | 0.09      | 1.30     | 2.43    |
-| v3.3    | + glide-slope + entry cap      | 0       | 0.09      | —        | —       |
+| v3.3    | + glide-slope + entry cap      | 0       | 0.09      | 1.17     | 2.37    |
 
 The biggest jump was v3: replacing the reward (so crashing is never better than surviving) and switching to steering-rate actions (so bang-bang is impossible). Everything after that was reward tuning to tighten tracking.
 
