@@ -1,0 +1,490 @@
+|  |  |  |
+| --- | --- | --- |
+
+**LANE DETECTION AND LANE KEEPING SUBSYSTEM**
+
+# Chapter Overview
+
+This chapter documents the complete engineering development of the Lane Detection and Lane Keeping subsystem for the indoor self-driving RC car. The subsystem detects lane markings using a Pi Camera V3 and a MobileNetV2-U-Net semantic segmentation model deployed as an ONNX model on Raspberry Pi 5. It then extracts lane geometry from the predicted mask, identifies the current lane, estimates the lane center, computes the lane error in pixels and centimeters, and sends the resulting data to the ROS 2 side of the system through a TCP bridge.
+
+The final design separates perception from control. The lane detection software does not directly command the motors. Instead, it publishes reliable lane information, including the lane error, confidence, lane identity, and diagnostic values. The lane keeping controller uses the lane error to generate steering correction. This separation makes the system modular, easier to debug, and safer to integrate with adaptive cruise control and lane-change behavior.
+
+# 1. Dataset Collection
+
+# 1.1 Purpose of Collecting a Custom Dataset
+
+A custom dataset was collected because the operating environment of this project is different from public road datasets. Public lane datasets usually contain outdoor roads, full-size vehicles, road paint, sunlight, shadows, rain, and camera positions that do not match the indoor RC car setup. In this project, the camera is mounted very low on a small vehicle, the track is an indoor oval map, the lane markings are custom printed or taped, and the visual scene includes furniture, floor reflections, and map-specific geometry.
+
+For this reason, training on public datasets alone would not provide the model with the correct appearance of the project track. A model trained on the actual track learns the real line colors, thicknesses, lighting reflections, camera angle, background, and perspective distortion seen during deployment. This improves robustness because the training data distribution matches the deployment distribution.             
+
+## 1.2 Camera Setup and Consistency
+
+Images were collected using the same camera type and mounting philosophy used during real-time operation. The camera was fixed on the vehicle body, with a fixed mounting position and tilt angle. Keeping the camera pose fixed is important because the image location, width, curvature, and apparent shape of the lane markings depend strongly on camera height and tilt. Any major change in camera mounting after training changes the visual distribution seen by the model.
+
+The runtime implementation captures frames at 640 x 480 from the Pi Camera pipeline and resizes each frame to the neural network input resolution of 320 x 240 before inference. This means that both training and deployment must use the same preprocessing convention: resize to 320 x 240, convert to RGB, normalize by dividing pixel values by 255, and arrange the tensor in channel-first format.
+
+**Input image size = 320 x 240**
+
+**Normalized pixel value = ****raw_pixel_value**** / 255.0**
+
+## 1.3 Dataset Scenarios
+
+The dataset was collected to cover the real situations that the vehicle experiences on the indoor map. The goal was not only to capture perfect centered driving, but also imperfect and shifted cases. This is important because during real driving the car may be left or right of center, one line may be partly outside the frame, and the car may be approaching or exiting a curve.
+
+**Table 1. Dataset scenario coverage**
+
+| **Scenario** | **Engineering purpose** |
+| --- | --- |
+| Straight outer lane | Provides clear examples of the separator and outer solid boundary in stable geometry. |
+| Straight inner lane | Teaches the model the appearance of the inner lane and its lane-marking arrangement. |
+| Curves | Exposes the model to partial visibility, curved markings, and perspective distortion. |
+| Centered driving | Provides ideal lane-following examples for lane center estimation. |
+| Left/right shifted driving | Improves model reliability when the car is not perfectly centered. |
+| Imperfect driving cases | Teaches robustness to real vehicle misalignment and non-ideal camera views. |
+| Inner/outer lane examples | Supports later current-lane identification and lane-change behavior. |
+
+                 
+
+# 2. Labeling and Mask Generation
+
+2.1 Labeling with LabelMe
+
+The collected images were labeled using LabelMe. Labeling is the process of manually marking the lane features in each image and assigning a semantic class name to each marked region. In this project, the labels describe the lane features needed for downstream lane keeping: the solid boundary and the dashed lane separator.
+
+During annotation, the user marks the visible lane pixels and stores the annotation as a JSON file. The JSON file contains the class name and the points defining the marked shape. This JSON file is not directly used as the neural network target. Instead, it must be converted into a mask image.
+
+## 2.2 Raw Image, Annotation, and Mask
+
+A raw image is the original camera frame captured from the track. It contains lane markings, background, reflections, furniture, floor texture, and any visible objects. An annotation is the manual LabelMe JSON representation of what pixels belong to which class. A mask is a class-index image where each pixel value represents the class ID. The segmentation model is trained using image-mask pairs.
+
+**Table 2. Difference between raw image, annotation, and mask**
+
+| **Item** | **Description** | **Used for** |
+| --- | --- | --- |
+| Raw image | Original camera frame from the vehicle camera. | Input to the neural network. |
+| Annotation JSON | Manual LabelMe shape and class-name data. | Intermediate labeling file. |
+| Mask | Class-index image with one class value per pixel. | Training target for semantic segmentation. |
+
+## 2.3 Classes Used
+
+**Table 3. Segmentation classes**
+
+| **Class ID** | **Class name** | **Visualization color** | **Meaning** |
+| --- | --- | --- | --- |
+| 0 | background | Dark gray | All pixels that are not lane markings. |
+| 1 | solid boundary | Green | Solid white lane boundary. |
+| 2 | lane separator | Cyan | Dashed separator between inner and outer lanes. |
+
+The background class is necessary because the model must learn what not to detect. Without a background class, every pixel would be forced into a lane class. The solid boundary and lane separator are separate classes because they have different meanings during lane identity and geometry extraction.
+
+# 3. Semantic Segmentation Justification
+
+Semantic segmentation was selected because lane keeping requires pixel-level lane information. Object detection would only produce bounding boxes around lane features, which is not enough to calculate the lane center or the lateral error accurately. A bounding box does not represent the exact lane shape, line position, or curvature.
+
+The segmentation model produces a predicted class for each pixel. This allows the system to extract the x-positions of the solid boundary and separator directly from the mask. The lane center and lane error are then calculated using classical geometry after neural network inference. This hybrid approach combines the robustness of deep learning for visual perception with deterministic geometry for control-relevant outputs.
+
+**Predicted mask(x, y) ∈ {0, 1, 2}**
+
+**Class 0 = background, Class 1 = solid boundary, Class 2 = lane separator**
+
+# 4. Model Selection, Training, and Export
+
+## 4.1 MobileNetV2-U-Net Selection
+
+The selected architecture was MobileNetV2-U-Net. U-Net is suitable for segmentation because it combines encoder features with decoder upsampling to recover spatial detail. MobileNetV2 was selected as the encoder because it is lightweight and suitable for Raspberry Pi deployment. This was a practical trade-off between segmentation accuracy and real-time performance.
+
+A heavier encoder could improve accuracy but would reduce inference speed on the Raspberry Pi 5 CPU. Since the vehicle operates at low indoor speed, the chosen architecture provided sufficient segmentation quality while maintaining an acceptable frame rate.
+
+## 4.2 Transfer Learning and Fine-Tuning
+
+Transfer learning was used through a pretrained MobileNetV2 encoder. The pretrained encoder already contains useful visual features such as edges, gradients, and textures. Fine-tuning adapted these features to the indoor lane dataset. This reduced the amount of data required compared with training the full network from scratch.
+
+## 4.3 Training Pipeline
+
+The training workflow followed the sequence below:
+
+Collect project-specific images from the indoor map.
+
+Label each image using LabelMe.
+
+Generate class-index masks from the annotations.
+
+Verify that every image has a matching mask.
+
+Resize images and masks to the model input size.
+
+Normalize image pixel values by dividing by 255.
+
+Split the dataset into training and validation subsets.
+
+Train the MobileNetV2-U-Net model.
+
+Monitor validation loss and per-class behavior.
+
+Save the best model based on validation performance.
+
+Export the model to ONNX for deployment on the Raspberry Pi 5.
+
+## 4.4 Validation and Best Model Selection
+
+Validation was performed using a held-out subset of the dataset. The goal was to confirm that the model learned actual lane markings rather than simply memorizing the training data or predicting mostly background. Validation included numerical monitoring and visual inspection of predicted masks. Visual inspection was especially important because a segmentation model can achieve low loss while still producing unsuitable geometry if the lane markings are shifted, fragmented, or missing.
+
+## 4.5 ONNX Export
+
+After training, the best model was exported to ONNX format for Raspberry Pi deployment. The final lane stream script loads the model from /home/pi/lane_model.onnx using ONNX Runtime. The ONNX model is executed once per frame, and the output is converted into a predicted mask using an argmax operation over the class dimension.
+
+**mask(x, y) = argmax_class(model_output[class, y, x])**
+
+# 5. Raspberry Pi Deployment and Runtime Inference
+
+## 5.1 Runtime Implementation
+
+The final runtime script runs on the Raspberry Pi 5. It performs camera capture, preprocessing, ONNX inference, geometry extraction, data streaming, and visual streaming. The design performs one inference per frame and reuses the result for both the ROS 2 data stream and the laptop visualization stream. This avoids running the neural network twice and reduces CPU load.
+
+The script opens two TCP servers. JSON data is sent through port 9999 to the ROS 2 bridge, while the visual JPEG stream is sent through port 9998 to the laptop viewer. This architecture allows the ROS 2 data and visual debugging stream to connect independently.
+
+**Table 4. Runtime communication ports**
+
+| **Port** | **Data type** | **Purpose** |
+| --- | --- | --- |
+| 9999 | JSON lane data | Bridge to ROS 2 on the laptop. |
+| 9998 | JPEG visual stream | Live viewer and debugging visualization. |
+
+## 5.2 Preprocessing Logic
+
+Each camera frame is converted from BGR to RGB, resized to the model input size, normalized, and reshaped into the tensor format expected by the model. The preprocessing logic ensures that the runtime input matches the training input.
+
+**frame_rgb = BGR_to_RGB(frame_bgr)**
+
+**frame_resized = resize(frame_rgb, 320 x 240)**
+
+**input_tensor = transpose(frame_resized / 255.0, HWC to CHW)**
+
+## 5.3 Model Output and Mask Post-Processing
+
+The model outputs a per-class score map. The system selects the class with the highest score at each pixel to produce a mask. The mask is then used for geometry extraction. The neural network therefore acts as a visual perception module, while the lane center and lane error are computed by deterministic post-processing.
+
+# 6. Geometry Extraction Logic and Equations
+
+## 6.1 Region of Interest
+
+The geometry logic operates on the bottom 80% of the predicted mask. The top 20% is removed because it usually contains distant or less reliable lane information. Keeping the ROI fixed was an intentional engineering decision, because the existing lane behavior had already been validated and changing the ROI could affect the working detection logic.
+
+**roi_top = int(0.20 x H)**
+
+**ROI = mask[roi_top : H, 0 : W]**
+
+## 6.2 Boundary and Separator Pixel Extraction
+
+The mask is searched for pixels belonging to class 1 and class 2. The x-coordinates of solid-boundary pixels and separator pixels are collected separately. The mean of these columns gives a single representative x-position for each lane marking in the current frame.
+
+**solid_cols = x positions where ROI == 1**
+
+**sep_cols = x positions where ROI == 2**
+
+**solid_x = mean(solid_cols), if solid_count is sufficient**
+
+**sep_x = mean(sep_cols), if sep_count is sufficient**
+
+## 6.3 Visibility Checks
+
+A marking is considered visible only if the number of detected pixels is above a threshold. This prevents small noise fragments from being interpreted as a valid lane marking. In the final code, both solid and separator detections use pixel-count checks before they are accepted into the geometry calculation.
+
+**actually_has_solid = solid_count ****>**** threshold_solid**
+
+**actually_has_sep = sep_count ****>**** threshold_separator**
+
+## 6.4 Exponential Smoothing of Marking Positions
+
+The solid-boundary and separator x-positions are smoothed over time. This reduces jitter caused by segmentation noise. When a marking temporarily disappears, the previous value is retained and decayed, allowing the system to remain stable for short visibility losses.
+
+**smoothed_x = alpha x measured_x + (1 - alpha) x previous_x**
+
+**previous_x = 0.95 x previous_x, when the marking disappears temporarily**
+
+## 6.5 Lane Width Estimation and Gating
+
+When both lane markings are visible, the lane width in pixels is calculated as the absolute difference between their x-positions. The measurement is accepted only if it lies within a reasonable pixel range. Accepted width measurements are stored in a history buffer, and the median is used as the remembered lane width. This makes the width estimate robust to outliers.
+
+**lane_width_px = |solid_x - sep_x|**
+
+**accept width only if 20 ****<**** lane_width_px ****<**** 0.9 x W**
+
+**remembered_width = median(width_history)**
+
+# 7. Current Lane Identification
+
+The system must determine whether the car is currently driving in the outer lane or inner lane. This is done using the separator position. The separator appears in different image regions depending on the current lane, so the separator x-position is compared with an empirically selected threshold.
+
+**if sep_x ****<**** SEP_THRESHOLD: vote = outer**
+
+**else: vote = inner**
+
+The final code uses a temporal voting buffer. A lane switch is accepted only when enough recent votes agree. This prevents a single ambiguous frame from flipping the lane state. This was important in curves, where separator visibility and position can become less reliable.
+
+**current_lane = most_common_vote, if vote_count ****>****= MIN_VOTES**
+
+**LANE_HISTORY = 10, MIN_VOTES = 6**
+
+# 8. Lane Center and Error Calculation
+
+## 8.1 Lane Center from Two Markings
+
+When both the solid boundary and separator are visible, the lane center is calculated as the midpoint between their x-positions. This is the most reliable case and is assigned the highest confidence.
+
+**lane_center_x = (solid_x + sep_x) / 2**
+
+## 8.2 Lane Center from One Marking
+
+In curves or partial views, only one lane marking may be visible. In this case, the algorithm estimates the lane center using the remembered lane width and the current lane state. This fallback allows the system to continue producing an error signal even when one boundary is temporarily missing.
+
+**center = visible_line_x +/- remembered_width / 2**
+
+The sign depends on whether the visible marking is the separator or solid boundary and whether the vehicle is in the inner or outer lane. This lane-aware logic is what allows the system to handle both lanes using the same output format.
+
+## 8.3 Lane Center Smoothing
+
+The final lane center is also smoothed over time. This avoids sudden steering commands caused by small frame-to-frame changes in the segmentation mask. Smoothing was therefore used as a reliability mechanism between perception and control.
+
+**center_smoothed = ALPHA x center_new + (1 - ALPHA) x center_previous**
+
+**ALPHA = 0.3**
+
+## 8.4 Pixel Error Equation and Sign Convention
+
+The image center is used as the vehicle reference in image space. The pixel error is calculated by subtracting the image center from the estimated lane center. This value is the main control signal for lane keeping.
+
+**image_center_x = W / 2**
+
+**error_px = lane_center_x - image_center_x**
+
+If the error is positive, the estimated lane center is to the right of the image center. If the error is negative, the estimated lane center is to the left. The controller uses this signed error to decide steering correction. The error is stable and validated during real driving, which is why it remains the primary lane keeping signal.
+
+# 9. Confidence and Reliability Logic
+
+Confidence is assigned based on the quality of the available visual evidence. This value helps downstream modules understand how reliable the current geometry estimate is. It also allows the system to degrade gracefully in curves instead of failing completely when one marking disappears.
+
+**Table 5. Confidence logic**
+
+| **Available visual evidence** | **Geometry method** | **Confidence** |
+| --- | --- | --- |
+| Solid boundary and separator visible | Use midpoint of both lines. | 1.0 |
+| Only solid boundary visible | Use solid boundary and remembered width. | 0.5 |
+| Only separator visible | Use separator and remembered width. | 0.4 |
+| No marking visible, previous center available | Hold previous center. | 0.2 |
+| No estimate available | Use image center fallback. | 0.0 |
+
+This confidence structure is an important engineering contribution because it turns uncertain visual information into explicit reliability information rather than hiding uncertainty from the controller.
+
+# 10. Pixel-to-Centimeter Calibration
+
+## 10.1 Purpose of the Centimeter Signal
+
+The pixel error is sufficient for lane keeping, but the trajectory planning teammate may require an approximate physical interpretation of the lateral error. For this reason, a centimeter-based lane error was added as a separate output. It is important that this value is a post-processing output only. It does not change lane detection, lane voting, center estimation, or the pixel error.
+
+## 10.2 Calibration Equations
+
+The centimeter conversion uses lane-specific offset and scale values. The offset compensates for camera mounting bias and any difference between the image center and the practical zero-error point. The scale converts pixels into centimeters.
+
+**error_calibrated_px = error_px - ERROR_OFFSET_LANE_PX**
+
+**error_cm = error_calibrated_px / PIXELS_PER_CM_LANE**
+
+The final implementation selects the constants based on the current lane. If the current lane is outer, the outer-lane constants are used. If the current lane is inner, the inner-lane constants are used. If the lane is unknown, the system falls back to the outer constants while confidence remains low.
+
+**Table 6. Final centimeter calibration constants in the uploaded implementation**
+
+| **Constant** | **Value** | **Meaning** |
+| --- | --- | --- |
+| LANE_WIDTH_CM | 36.7 | Measured real lane width used for documentation and calibration context. |
+| ERROR_OFFSET_OUTER_PX | -8.5 | Outer-lane zero-error pixel offset. |
+| ERROR_OFFSET_INNER_PX | -7.5 | Inner-lane zero-error pixel offset. |
+| PIXELS_PER_CM_OUTER | 2.19 | Outer-lane pixel-to-centimeter scale. |
+| PIXELS_PER_CM_INNER | 2.51 | Inner-lane pixel-to-centimeter scale. |
+
+## 10.3 Accuracy and Engineering Interpretation
+
+The centimeter value is an approximate physical estimate. It is most meaningful on straight sections, where the car heading is aligned with the lane direction. In curves, the image error includes lateral offset, heading angle, and perspective effects. Therefore, the centimeter value can contain a systematic curve bias.
+
+For the final system, this is acceptable because the controller uses the validated pixel error. The centimeter value is useful for reporting, analysis, and approximate planning thresholds, but it is not the only source of control authority.
+
+# 11. Curve Challenge as an Engineering Problem
+
+## 11.1 Why Curves Are Difficult
+
+Curves introduce several perception and geometry challenges. The model can still segment lane markings in curves, but converting these markings into a stable lane center is more difficult. In a curve, the visible lane markings are not straight, the camera may see only one lane boundary, and perspective changes the apparent lane width.
+
+Additionally, the vehicle heading must be tangent to the curve. A small heading error changes the camera view and shifts the apparent lane center even if the vehicle is physically near the center of the lane. This makes manual curve calibration unreliable because the true zero-error position is difficult to establish by hand.
+
+## 11.2 Observed Curve Issues
+
+During testing, curves caused several types of ambiguity. One marking could leave the field of view, the separator could move across the frame, and additional boundary segments could appear in the image. These effects could influence lane center estimation, lane-width memory, current-lane stability, and the centimeter conversion.
+
+The issue was not treated as a model failure. Instead, it was treated as an engineering estimation problem caused by limited visibility, perspective distortion, and ambiguous geometry.
+
+## 11.3 Engineering Responses
+
+**Table 7. Curve-related challenges and engineering responses**
+
+| **Challenge** | **Engineering response** |
+| --- | --- |
+| Limited visibility of one marking | Use one-line fallback with remembered lane width and lower confidence. |
+| Perspective changes apparent lane width | Gate width measurements and use median width history. |
+| Temporary lane ambiguity | Use temporal voting instead of single-frame lane switching. |
+| Frame-to-frame jitter | Smooth solid position, separator position, and lane center. |
+| Unreliable curve centimeter ground truth | Calibrate centimeters on straights and treat curve centimeters as approximate. |
+
+These mechanisms allowed the system to continue providing a stable lane-error signal without redesigning the pipeline close to the project deadline.
+
+# 12. ROS 2 Output and Controller Handoff
+
+## 12.1 Perception Output Fields
+
+The lane stream script returns a geometry dictionary containing the main outputs needed by the controller and debugging tools. These include the lane center, pixel error, centimeter error, current lane, remembered width, curvature estimate, confidence, pixel counts, and visibility flags.
+
+**Table 8. Main lane perception output fields**
+
+| **Field** | **Purpose** |
+| --- | --- |
+| center | Estimated lane center in model image coordinates. |
+| error | Signed pixel error used as the primary lane keeping signal. |
+| error_cm | Auxiliary centimeter estimate for planning and interpretation. |
+| lane | Current lane state: outer, inner, or unknown. |
+| width | Remembered lane width in pixels. |
+| curvature | Simple separator slope estimate used as a diagnostic. |
+| confidence | Reliability level of the current geometry estimate. |
+| solid_count / sep_count | Number of detected pixels for each lane class. |
+| solid_x / sep_x | Representative x-position for each detected marking. |
+
+## 12.2 ROS 2 Topic Flow
+
+The Raspberry Pi script sends JSON data to the laptop bridge through port 9999. The bridge then exposes the lane information to ROS 2 topics. The exact topic names depend on the bridge node implementation and should be confirmed from the final bridge file. Based on the system design, the key logical outputs are the pixel lane error, centimeter lane error, current lane, confidence, lane center, and lane width.
+
+**Table 9. Logical ROS 2 outputs for controller handoff**
+
+| **Logical output** | **Role in the system** |
+| --- | --- |
+| /lane_error or equivalent | Primary pixel error used by lane keeping controller. |
+| /lane_error_cm or equivalent | Approximate physical error used for planning/analysis. |
+| /current_lane or equivalent | Inner/outer lane state used for lane change logic. |
+| /lane_confidence or equivalent | Reliability value for downstream filtering. |
+| /lane_center or equivalent | Estimated lane center position. |
+| /lane_width or equivalent | Remembered pixel lane width. |
+
+## 12.3 Controller Handoff
+
+The lane detection subsystem does not directly drive the vehicle. It provides the measured lane information to the controller. The controller uses the signed lane error to calculate steering correction. This modular interface allows perception to be debugged independently from motor control, and allows future subsystems such as adaptive cruise control and lane change logic to consume the same lane state information.
+
+# 13. Final End-to-End System Sequence
+
+The final lane detection and lane keeping sequence is:
+
+- 1. Pi Camera V3 captures a 640 x 480 frame.
+
+- 2. Frame is converted and resized to 320 x 240.
+
+- 3. Pixel values are normalized by dividing by 255.
+
+- 4. ONNX model predicts a segmentation output.
+
+- 5. Argmax converts model output into a class-index mask.
+
+- 6. ROI is selected from the bottom 80% of the mask.
+
+- 7. Solid-boundary and lane-separator pixels are extracted.
+
+- 8. Representative solid_x and sep_x values are computed.
+
+- 9. Positions are smoothed across frames.
+
+- 10. Separator position contributes to current-lane temporal voting.
+
+- 11. Lane width is updated only when both lines are visible and valid.
+
+- 12. Lane center is calculated or estimated using fallback logic.
+
+- 13. Pixel error is calculated as lane center minus image center.
+
+- 14. Centimeter error is calculated as a lane-aware post-processing value.
+
+- 15. Confidence is assigned based on available visual evidence.
+
+- 16. JSON data is sent to the ROS 2 bridge.
+
+- 17. Annotated video is streamed to the laptop viewer.
+
+- 18. The lane keeping controller uses the lane error to generate steering correction.
+
+# 14. Debugging, Validation, and Reliability Testing
+
+## 14.1 Dataset and Mask Validation
+
+The dataset was validated by checking image-mask pairing, confirming that masks contained only the expected class IDs, and visually inspecting colored mask overlays. This ensured that the training targets were correct before model training.
+
+## 14.2 Model Validation
+
+The trained model was validated by inspecting predictions on validation images. The important check was not only numerical performance, but whether the predicted masks aligned with the physical lane markings and preserved the difference between solid boundary and lane separator.
+
+## 14.3 ONNX and Raspberry Pi Validation
+
+After export, the ONNX model was tested on the Raspberry Pi using dummy input to verify that it loaded correctly and produced the expected output shape. Runtime benchmarking was then performed to estimate frame rate. This confirmed that the final deployment could run on the Raspberry Pi 5 CPU.
+
+## 14.4 Live Stream Validation
+
+The live annotated stream was used to validate the complete perception pipeline. The overlay allowed the team to confirm that the green region followed the solid boundary, the cyan region followed the separator, and the blue line represented a reasonable lane center. This visual stream was essential for debugging curve behavior and lane-state stability.
+
+# 15. Key Engineering Decisions and Trade-Offs
+
+**Table 10. Engineering decisions and justifications**
+
+| **Decision** | **Reason** |
+| --- | --- |
+| Use custom dataset | The indoor track, camera height, and lane markings differ from public road datasets. |
+| Use semantic segmentation | Lane keeping needs pixel-level lane geometry, not only bounding boxes. |
+| Use MobileNetV2-U-Net | Balances segmentation accuracy with Raspberry Pi performance. |
+| Keep pixel error as primary signal | It is the most directly validated control signal. |
+| Add centimeter error as post-processing | Provides physical interpretation without risking lane logic. |
+| Calibrate centimeters on straights | Straights provide a reliable physical reference; curves do not. |
+| Avoid late homography integration | Would add risk close to defense while lane following already works. |
+| Use confidence levels | Communicates measurement reliability to the controller. |
+| Use temporal voting | Prevents unstable lane switching from ambiguous frames. |
+
+# 16. Limitations and Future Improvements
+
+## 16.1 Current Limitations
+
+The centimeter error is approximate, especially in curves.
+
+The system depends on the camera remaining fixed in position and tilt.
+
+Strong glare or reflections on the laminated track can affect segmentation quality.
+
+The model is specialized for the indoor map used in training and testing.
+
+When both lane markings disappear, the system relies on previous-center memory with low confidence.
+
+Exact ROS 2 topic names should be confirmed from the final bridge node implementation.
+
+## 16.2 Future Improvements
+
+Implement bird’s-eye-view homography using four measured physical markers for more accurate ground-plane centimeter measurements.
+
+Add camera undistortion before inference or before geometry extraction if distortion becomes significant.
+
+Use row-wise or polynomial lane fitting instead of single mean x-position to improve curve geometry.
+
+Fuse lane detection with odometry or IMU data for smoother trajectory planning.
+
+Add explicit physical plausibility rejection for sudden impossible jumps in error or lane width.
+
+Train additional data under different lighting and glare conditions.
+
+Bird’s-eye-view homography was intentionally left as future work because it requires careful physical marker placement, measurement, calibration, and validation. Adding it close to the defense deadline would introduce risk into an already working lane detection and lane keeping system.
+
+# 17. Conclusion
+
+The Lane Detection and Lane Keeping subsystem was developed as a complete perception pipeline for an indoor self-driving RC car. The team collected a custom dataset, labeled lane markings using semantic classes, trained a MobileNetV2-U-Net segmentation model, exported it to ONNX, and deployed it on Raspberry Pi 5 for real-time operation.
+
+The final system converts each camera frame into a predicted mask, extracts solid-boundary and lane-separator geometry, identifies the current lane, estimates the lane center, computes lane error in pixels and centimeters, assigns confidence, and sends the results to the ROS 2 bridge and visual viewer. The design uses temporal voting, width gating, smoothing, confidence handling, and fallback logic to remain reliable during curves and partial visibility.
+
+The most important engineering decision was to keep the pixel error as the validated control signal while providing centimeter error as an auxiliary calibrated output. This allowed the system to remain robust for lane keeping while still supporting trajectory-planning interpretation. The subsystem is therefore suitable for integration with the lane keeping controller, lane change behavior, and the wider self-driving RC car architecture.

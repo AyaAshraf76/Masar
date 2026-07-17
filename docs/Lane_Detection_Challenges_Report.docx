@@ -1,0 +1,237 @@
+*Raa3d Car – Lane Detection **&** Trajectory Control*
+
+**Technical Challenges and Solutions**
+
+**Camera-Based Lane Detection and Trajectory Control**
+
+Raa3d Car – Autonomous Race Car Project
+
+July 2026
+
+**Table of Contents**
+
+*[Update field in Word to generate Table of Contents]*
+
+# **1. System Overview**
+
+The Raa3d Car is an autonomous race car that navigates a two-lane oval track using only a forward-facing Raspberry Pi camera and an ONNX segmentation model. The system runs two interdependent software components:
+
+- Lane Detection (lane_stream_final.py): runs on the Raspberry Pi 5, captures camera frames at ~5.5 fps, performs ONNX inference to segment the image into three classes (background, solid boundary, lane separator), and computes the car's lateral error relative to the lane center. The result is streamed as JSON over TCP.
+
+- Trajectory Controller (trajectory_angle_v11.py): reads the JSON stream, applies a PID-like controller (proportional + derivative + leaky integral) to compute the angular velocity ω, converts it to individual wheel RPMs via differential-drive kinematics, and sends motor commands to an STM32 microcontroller over UART.
+
+The track has two lanes (inner and outer), each 36.7 cm wide, separated by a dashed line (the separator) and bounded by solid lines (the walls). The car must keep itself centered in its assigned lane, including through the two semicircular corners of the oval.
+
+# **2. Challenge 1: Solid-Only Fallback Sign Error**
+
+## **2.1 Problem**
+
+When only the solid boundary is visible (the separator exits the camera's field of view in one corner of the oval), the lane center must be estimated from a single line using center = solid_x ± lw/2, where lw is the lane width in pixels. The original code used solid_x − lw/2 for both lanes, but this sign is only correct for the outer lane (where the solid boundary, the outer wall, is to the right of center). In the inner lane, the solid boundary (inner wall) is to the left of center, so the correct formula is solid_x + lw/2. Using the wrong sign placed the estimated center a full lane width away from reality.
+
+## **2.2 Impact**
+
+During inner-lane corners where only the solid boundary was visible, the controller received an error of approximately +35 cm (one lane width) in the wrong direction. The car steered hard across the separator and into the outer lane. In the logs, this appeared as sustained conf=0.50 frames with the error climbing from ±3 cm to ±17 cm before the car crossed the lane boundary.
+
+## **2.3 Solution**
+
+The fallback was corrected to use lane-aware signs: solid_x − lw/2 for the outer lane (solid wall is right of center) and solid_x + lw/2 for the inner lane (solid wall is left of center). This matched the sign convention already used in the separator-only fallback branch, which had been correct from the start.
+
+# **3. Challenge 2: Corner Error Bias from Pixel Averaging**
+
+## **3.1 Problem**
+
+The original code computed each line's x-position as the arithmetic mean of all its pixel column coordinates across the entire ROI: solid_x = np.mean(solid_cols). On straight sections this is correct because the lines are nearly vertical, giving the same x at every row. In corners the lines curve in the image: the far-ahead pixels at the top of the ROI are pulled toward the inside of the turn. The mean of all pixels, spanning both the curved far-ahead region and the correct near-car region, produces a biased estimate that drifts toward the separator. The car reads error ≈ 0 when it has actually drifted 3–9 cm.
+
+## **3.2 Quantification**
+
+A simulation of a typical corner geometry (separator shifting 60 px from bottom to top of ROI, solid boundary shifting 20 px) showed that np.mean across the full ROI produces 8.7 cm of bias. Various mitigation strategies were tested:
+
+- Bottom 35% band (plain mean inside the band): 2.9 cm bias
+
+- Row-weighted mean (power=3 across full ROI): 3.3 cm bias
+
+- Bottom 15% band + row-weighted mean inside it: 0.5 cm bias (the best result)
+
+- Near-car median of the bottom 20% of rows: comparable accuracy with better robustness to outliers
+
+## **3.3 Solution Progression**
+
+Three approaches were tested in sequence:
+
+- Bottom-band approach: use only the bottom N% of the ROI for center estimation, with a fallback to the full ROI when the band has too few pixels. This improved one corner but was insufficient for the other, where the separator exited the field of view entirely.
+
+- Row-weighted mean: weight each pixel by (row / roi_height)^power, so bottom rows dominate. This was cleaner but still showed residual bias because even low-weighted far-ahead pixels contribute.
+
+- Near-car median: take the bottom-most slice of pixels that actually exist and return their median column. This eliminated both the curvature bias and the extrapolation problem (see Challenge 4) and became the final approach.
+
+# **4. Challenge 3: Two-Wall Contamination in Corners**
+
+## **4.1 Problem**
+
+In one corner of the oval track, the separator exits the camera's field of view (Sep:0 in the logs). The segmentation model then classifies pixels from both the outer wall and the inner wall as class 1 (solid boundary), since both are solid painted lines. The pixel count jumps from the normal 200–600 to 1000–1900. Computing np.mean (or even the near-car median) across pixels from two walls separated by the full track width gives a position near the track center, not the lane center. The fallback center = solid_x − lw/2 then lands near the separator — approximately one lane width from the correct position.
+
+## **4.2 Diagnosis**
+
+The key diagnostic was comparing Sep:0 frames with both-lines frames at the same physical car position. Both-lines frames read error ≈ −12 px; Sep:0 frames with the same car position read +41 to +100 px. The difference was almost exactly one lane width, confirming that the wrong wall's pixels were dominating the mean.
+
+## **4.3 Solution: Anchor-Based Cluster Selection**
+
+The fix separates two concerns: identifying which pixels belong to the correct boundary (cluster selection) and measuring where that boundary is (position extraction). An anchor tracks the previous known position of each line, rate-limited so it can't be yanked by a single garbage frame. When pixels from multiple walls are present, only those within a generous radius of the anchor (±55% of lane width) are kept. The radius is wide enough that real car motion passes through, but tight enough to reject the opposite wall, which is approximately one full lane width away.
+
+# **5. Challenge 4: Separator Blob Contamination (Inner Lane)**
+
+## **5.1 Problem**
+
+In the inner lane, the camera looks along the separator (the dashed line between the two lanes). In corners, the segmentation model over-classifies the separator region, painting a huge curved blob across the image. Separator pixel counts reach 1500–2500 (normal: 200–700). The blob's mean position is pulled by the curved far-ahead pixels, and even the midpoint of (solid_x + sep_x) / 2 becomes inaccurate because sep_x itself is contaminated. Errors of +90 to +124 px were observed on both-lines frames where the model reported Conf:1.00, meaning the controller trusted and acted on completely wrong information.
+
+## **5.2 Diagnosis**
+
+The critical observation was that inner-lane errors correlated with separator pixel count, not with car position. Frames with Sep:164 read error ≈ −7 px (correct), while frames with Sep:2256 at the same physical position read +90 px. The error magnitude scaled with how contaminated the separator was, not with how far the car had drifted.
+
+## **5.3 Solutions Attempted**
+
+- Proximity filtering (same as Challenge 3): keep only separator pixels near the previous anchor position. This helped but was insufficient because the blob is a single wide curved region centered near the correct position — filtering a slice of it and computing the mean still left significant bias.
+
+- Linear fit extrapolation: fit a straight line through the separator pixels and evaluate at the bottom row of the ROI. This was worse than expected because the blob often didn't reach the bottom rows, and extrapolating a straight line past a curved region overshot massively. This also triggered numpy's 'Polyfit may be poorly conditioned' warning.
+
+- Clean-frame gating: reject contaminated frames (Sep > 900) and hold the last clean center. This prevented spikes but made the system unresponsive — the error froze and didn't track car motion, which the user diagnosed by physically moving the car and observing no change in the reported error.
+
+- Learned-offset approach (final): on clean both-lines frames (solid ≤ 800, sep ≤ 900), the system learns the signed offset from each line to the lane center. On contaminated frames, it reconstructs the center from whichever line is cleaner using its learned offset, preferring the solid boundary when the separator is bloated and vice versa.
+
+# **6. Challenge 5: Polyfit Extrapolation Overshoot**
+
+## **6.1 Problem**
+
+An intermediate solution attempted to find each line's near-car position by fitting a straight line through its pixels and evaluating at the bottom row of the ROI (row 191 in a 192-row ROI). This assumes the pixels span all the way to the bottom, but in the inner lane the separator blob often occupies only rows 0–140. Extrapolating 50+ rows past where the pixels actually end, through a curve that the straight fit cannot capture, overshoots dramatically. Observed errors reached +90 to +124 px, and numpy raised a RankWarning for degenerate fits.
+
+## **6.2 Solution**
+
+The polyfit-and-extrapolate approach was replaced with a near-car median that never projects past the actual data. The function finds the bottom-most 25% of rows that contain pixels and returns the median column of those rows. This guarantees the returned position corresponds to where the line actually is (interpolation), never where it might be (extrapolation).
+
+# **7. Challenge 6: Anchor Contamination and Snowballing Drift**
+
+## **7.1 Problem**
+
+Several versions of the code suffered from a state contamination sequence: an unreliable measurement updated prev_solid_pos or prev_sep_pos, and the next frame's cluster filter then anchored to the wrong position, accepting the wrong cluster of pixels, which further corrupted the anchor. Over several frames this snowballed: the anchor drifted toward the wrong wall, and the error grew from ±10 px to ±50 px without any physical car movement.
+
+## **7.2 Specific Instances**
+
+- Startup contamination: the first few frames had Lane:unknown and nonsensical geometry (error climbing from +70 to +141 px). These frames committed to prev_solid_pos, seeding the anchor at a garbage position before any real detection occurred.
+
+- Unfiltered-mean contamination: the code computed the raw mean of all solid pixels, smoothed it into prev_solid_pos, and then ran the filter using the already-contaminated anchor. The filter radius was centered on the drifted anchor, so it kept the wrong pixels.
+
+- Gate runaway: the consistency gate compared each frame to prev_center. When one bad frame slipped through, prev_center crept up, and the next bad frame (+91 px) was 'close to' the previous (+94 px) and passed the gate unchecked. Five to six sustained spikes resulted instead of an isolated glitch.
+
+## **7.3 Solutions**
+
+- Save-before-update: the previous anchor positions are saved at the start of each frame, before any smoothing or filtering. All cluster selection uses the saved (pre-update) anchor so it cannot be contaminated by the current frame's potentially bad data.
+
+- Startup guard: state variables (prev_solid_pos, prev_sep_pos) are only committed once a lane is confidently known, preventing the unknown-lane garbage frames from seeding the anchors.
+
+- Hard-set only from clean frames: anchors are now directly set (not EMA-smoothed) only from frames where both lines are present and both pixel counts are normal. Contaminated frames may only soft-track the anchors with a rate limit.
+
+# **8. Challenge 7: Output Freezing (Unresponsive Error)**
+
+## **8.1 Problem**
+
+In an attempt to prevent contaminated frames from corrupting the error, several versions of the code held the output to a baseline (either prev_center or a rolling median of clean frames) whenever a frame was classified as contaminated. Since nearly every inner-lane corner frame had Sep > 900, they were all classified as contaminated. The error froze at whatever value the last clean frame had produced and ignored car motion entirely. Physically moving the car left or right produced no change in the reported error — a behavior the user correctly identified as a fundamental failure of the measurement system.
+
+## **8.2 Lesson**
+
+This was a case of the cure being worse than the disease. An inaccurate measurement that tracks motion is more useful for closed-loop control than an accurate-once measurement that freezes. The controller has its own filtering (low-pass, innovation clamp, confidence weighting) and can tolerate noisy inputs; what it cannot tolerate is a frozen input, because the derivative term goes to zero and the integral continues to wind on a stale error.
+
+## **8.3 Solution**
+
+All output-holding logic was removed. Every frame emits a live measurement, so moving the car always moves the error. The only remaining protection is a per-frame sanity clamp that limits how far the center may jump in a single frame (0.6 × lane_width). This rejects isolated garbage spikes while still allowing unrestricted motion over consecutive frames — it limits the step, not the destination.
+
+# **9. Challenge 8: Trajectory Controller Issues**
+
+## **9.1 Error Filter Over-Damping (v8 → v9)**
+
+The trajectory controller's error filter used confidence-squared scaling (alpha × conf²) combined with an innovation clamp (max 10 cm per frame). In corners, confidence drops to 0.4–0.5 because only one line is visible, which pushed the effective alpha below 0.10. The filter then crawled at 1.0–1.5 cm per frame while the real error moved 8+ cm per frame. The car drove essentially straight through corners, drifting across the lane before the filter caught up.
+
+The fix replaced conf² with linear confidence scaling (alpha × conf) with a raised floor of 0.20, and added a trend-release mechanism: three consecutive same-sign clamped innovations open the clamp by 4×, because a real sustained drift pushes the same direction every frame while a noise spike lasts only one frame. This asymmetry distinguishes real geometry changes from measurement glitches.
+
+## **9.2 Lane-Flip Reseed on Garbage Frame (v8 → v9)**
+
+When the camera's lane label flipped (e.g., from inner to outer), the error basis shifted (different per-lane calibration offsets). The controller reseeded its filter to the new error value. But a lane flip sometimes arrived on a low-confidence frame (conf=0.40) with a garbage error measurement. Reseeding to that value snapped the filter from a correct +2.5 cm to a wrong +29.9 cm, and the slow confidence-weighted filter then held wrong-direction saturated steering (ω = +0.300) for approximately 3 seconds.
+
+The fix gates the reseed on the flip frame's own confidence: conf ≥ 0.8 snaps the filter, 0.5–0.8 blends 50/50 with the current state, and below 0.5 the filter state is kept entirely. The trend-release mechanism converges to the correct value within a few frames if the flip was real.
+
+## **9.3 Stale-dt Integral Injection**
+
+After a lane change maneuver (pure pursuit following a waypoint trajectory), the controller returned to lane-keeping mode. The variable last_frame_time was still set to the time of the last lane-keeping frame before the maneuver, so the first frame back computed dt = current_time − last_frame_time ≈ 0.5 seconds. The integral term accumulated the large transient landing error (typically 20+ cm) over that inflated dt in a single step, injecting a large integral wind-up. This stored command pushed the car through zero error and across the separator after landing.
+
+The fix resets last_frame_time and err_deriv to None/zero on lane-change completion and on manual resume (the 'g' key), so the first frame back computes a fresh dt from the current time.
+
+## **9.4 Leaky Integral Equilibrium Error**
+
+The controller uses a leaky integral (exponential decay toward zero with time constant τ) to provide the sustained angular velocity that corners need. The leaky integral settles at an equilibrium where accumulation equals decay: err_eq = ω_needed × 100 / (KI × τ). With KI = 0.30 and τ = 8 s, a corner needing ω = 0.12 rad/s settles at err_eq = 5.0 cm — exactly the persistent −4 to −5 cm error seen in the logs. The error is not sluggishness; it is the integral's designed steady state.
+
+Reducing this equilibrium error requires either increasing KI, increasing τ, or reducing the integral's burden by adding curvature feed-forward. With KI = 0.40 and τ = 12 s (and no feed-forward), the equilibrium drops to 2.5 cm. Adding curvature feed-forward (calibrated from the logs as K_CURV = −0.035 with a deadband of 2.5) further reduces it to approximately 0.6 cm, though feed-forward was kept disabled in the production version pending on-track calibration.
+
+# **10. Challenge 9: Lane Selection and Auto-Return**
+
+## **10.1 Requirement**
+
+The controller needed a mode to select which lane to keep (inner or outer), with the ability to command lane changes and to automatically return to the target lane if the car drifted across the separator.
+
+## **10.2 Implementation**
+
+Keyboard commands (i = keep inner, o = keep outer) set a target_lane variable. The target auto-locks to whichever lane the camera first reports confidently at startup, so the car stays in its starting lane with zero keystrokes. If the camera reports the wrong lane on WRONG_LANE_FRAMES (8) consecutive high-confidence frames, the controller auto-triggers the pure-pursuit lane-change maneuver back to the target. A cooldown of 4 seconds after any lane change prevents ping-pong oscillation between lanes. Transient 1–3 frame lane flips during corner recoveries never reach the 8-frame threshold and are ignored.
+
+# **11. The Learned-Offset Approach (Final Architecture)**
+
+## **11.1 Motivation**
+
+Every fallback branch (solid-only, separator-only) uses center = line_x ± lw/2 with a hardcoded sign and a smoothed lane width. Both assumptions fail in corners: the sign depends on correctly identifying which boundary is visible, and lw is a laggy median that may not match the current perspective. The observation that triggered the final approach was: both-lines frames are always correct (the midpoint of two correctly-extracted lines is the lane center by definition), so the geometry learned from those frames should be inherited by the unreliable frames.
+
+## **11.2 Design**
+
+On every clean both-lines frame (both pixel counts within normal ranges), the system computes and EMA-learns, per lane, two signed offsets:
+
+- offset_solid = center − solid_x (how far the center is from the solid boundary)
+
+- offset_sep = center − sep_x (how far the center is from the separator)
+
+These offsets encode the exact sign, magnitude, and any camera-specific bias — they are not assumed from geometry but measured from the frames that are known to be correct.
+
+On unreliable frames (single-line, or contaminated blob), the center is reconstructed as line_x + learned_offset using whichever line is cleaner. When the separator is a 2000-pixel blob but the solid boundary has a normal count, the system prefers the solid line's learned offset and ignores the corrupted separator entirely. The learned offsets continuously adapt as the car moves and the perspective changes, so they remain accurate through corners.
+
+# **12. Remaining Limitations and Future Work**
+
+## **12.1 Corner Error Residuals**
+
+Despite all the improvements documented above, corners still produce larger errors than straight sections. The fundamental limitation is the segmentation model itself: in corners, the perspective transformation causes the dashed separator to appear as a wide, curved blob rather than a thin line. No amount of post-processing can fully recover accurate line positions from a fundamentally ambiguous segmentation. Possible improvements include:
+
+- Retraining the segmentation model with more corner-augmented data, specifically targeting the inner-lane perspective where the separator fills a large portion of the image.
+
+- Adding a perspective correction (inverse perspective mapping / bird's-eye view) before segmentation, which would make the lines appear straight and thin regardless of curvature.
+
+- Using a higher camera resolution or frame rate to capture more detail in corners.
+
+- Implementing a model-based state estimator (e.g., Extended Kalman Filter) that fuses camera measurements with odometry to maintain accurate position estimates even when the camera measurement is unreliable.
+
+## **12.2 Single-Camera Limitation**
+
+The entire system relies on a single forward-facing camera. When the separator exits the field of view in one corner (Sep:0), the system must fall back to single-line estimation, which is inherently less accurate than the both-lines midpoint. A second camera or a wider field-of-view lens would eliminate this blind spot.
+
+## **12.3 Frame Rate**
+
+At 5–6 fps, the car moves approximately 1.5–2 cm between frames at 0.10 m/s. In corners where the lateral dynamics are fastest, this discretization means the controller is always reacting to a position that is 1–2 cm stale. A higher frame rate (achievable with a lighter model or hardware acceleration) would improve corner tracking.
+
+# **13. Summary of Challenges**
+
+The following table summarizes the nine major challenges, their root causes, and the final approach used for each.
+
+| **#** | **Challenge** | **Root Cause** | **Solution** |
+| --- | --- | --- | --- |
+| 1 | Solid-only fallback sign | Same sign (−lw/2) used for both lanes | Lane-aware sign: −lw/2 outer, +lw/2 inner |
+| 2 | Corner error bias | np.mean across all ROI rows includes curved far-ahead pixels | Near-car median of bottom 20% of rows |
+| 3 | Two-wall contamination | Both walls classified as solid (Sep:0), mean lands at track center | Anchor-based cluster selection rejects the far wall |
+| 4 | Separator blob (inner) | Model over-classifies separator (2000+ px), pulling the midpoint | Learned offset from clean frames; prefer the cleaner line |
+| 5 | Extrapolation overshoot | Polyfit projected past where pixels exist on a curved blob | Near-car median (never extrapolates) |
+| 6 | Anchor contamination | Bad frames update anchors; next filter uses the drifted anchor | Save-before-update; hard-set only from clean both-lines frames |
+| 7 | Output freezing | Holding output to baseline on contaminated frames | Removed all holding; per-frame sanity clamp instead |
+| 8 | Controller issues | conf² damping, garbage reseed, stale dt, integral equilibrium | Linear conf, gated reseed, dt reset, raised KI/τ |
+| 9 | Lane selection | No mechanism to command or enforce a target lane | i/o keys, auto-lock, 8-frame auto-return with cooldown |
